@@ -1,0 +1,1939 @@
+import tkinter as tk
+from tkinter import filedialog, ttk, messagebox
+from PIL import Image, ImageTk, ImageDraw
+import random, math, time, os, json
+import win32gui, win32con
+
+# ==================== ЖЁСТКИЕ КОНСТАНТЫ ====================
+TRANSPARENT_COLOR = "#010101"
+TRANSPARENT_RGB = (1, 1, 1)
+
+PET_BASE_WIDTH = 48
+PET_BASE_HEIGHT = 80
+PET_WIDTH = PET_BASE_WIDTH
+PET_HEIGHT = PET_BASE_HEIGHT
+CANVAS_SIZE = int(math.hypot(PET_WIDTH, PET_HEIGHT)) + 30
+
+TASKBAR_HEIGHT = 40
+ANIMATION_SPEED = 0.15
+BATTLE_APPROACH = 0.7
+
+CFG_FILE = "taskbar_pets_cfg.json"
+
+
+def apply_scale(scale):
+    global PET_WIDTH, PET_HEIGHT, CANVAS_SIZE
+    PET_WIDTH = max(8, int(PET_BASE_WIDTH * scale))
+    PET_HEIGHT = max(12, int(PET_BASE_HEIGHT * scale))
+    CANVAS_SIZE = int(math.hypot(PET_WIDTH, PET_HEIGHT)) + 30
+
+
+# ==================== НАСТРАИВАЕМЫЕ ПАРАМЕТРЫ ====================
+DEFAULT_CFG = {
+    # --- Общее ---
+    "gravity":               0.8,
+    "walk_speed":            1.6,
+    "bounce_factor":         0.4,
+    "walk_dist_min":        20.0,
+    "walk_dist_max":       120.0,
+    "idle_min":              0.6,
+    "idle_max":              3.0,
+    "pet_scale":             1.0,
+
+    # --- Бой ---
+    "hp_max":              100.0,
+    "battle_damage":         0.6,
+    "battle_push_min":       3.0,
+    "battle_push_max":      20.0,
+    "crit_threshold":       12.0,
+    "super_crit_threshold": 17.0,
+    "battle_range":         60.0,
+    "collision":            True,
+
+    # --- Пинбол ---
+    "paddle_radius":        55.0,
+    "pinball_push_min":      6.0,
+    "pinball_push_max":     22.0,
+    "pinball_speed_limit":  28.0,
+    "pinball_gravity":       0.6,
+
+    # --- Футбол ---
+    "ball_radius":          14.0,
+    "ball_friction":         0.995,
+    "ball_max_speed":       45.0,
+    "ball_gravity":          0.35,
+    "ball_bounce":           0.55,
+    "ball_lift_min":         7.0,
+    "ball_lift_max":        14.0,
+    "pet_speed_football":    4.5,
+    "kick_force":            8.0,
+    "goal_bias":             5.0,
+    "jump_radius":         130.0,
+    "jump_vel_min":         10.0,
+    "jump_vel_max":         18.0,
+    "keeper_offset":   70.0,   # насколько вратарь стоит от своих ворот
+    "kickoff_spread": 220.0,   # разброс позиций полевых игроков от центра
+}
+
+
+def make_default_image():
+    img = Image.new("RGBA", (PET_WIDTH, PET_HEIGHT), (0, 0, 0, 0))
+    d = ImageDraw.Draw(img)
+    d.rectangle([PET_WIDTH // 4, PET_HEIGHT // 5, 3 * PET_WIDTH // 4, PET_HEIGHT],
+                fill=(70, 130, 200, 255), outline=(255, 255, 255, 255), width=2)
+    hr = PET_WIDTH // 6
+    d.ellipse([PET_WIDTH // 2 - hr, 0, PET_WIDTH // 2 + hr, hr * 2],
+              fill=(255, 220, 180, 255), outline=(255, 255, 255, 255), width=2)
+    d.ellipse([PET_WIDTH // 2 - 8, 6, PET_WIDTH // 2 - 4, 10], fill=(0, 0, 0, 255))
+    d.ellipse([PET_WIDTH // 2 + 4, 6, PET_WIDTH // 2 + 8, 10], fill=(0, 0, 0, 255))
+    return img
+
+
+class FloatingText:
+    def __init__(self, app, x, y, text, color="#ff2b2b", size=14, duration=1.0):
+        self.app = app
+        self.x = x
+        self.y = y
+        self.duration = duration
+        self.start = time.time()
+
+        self.win = tk.Toplevel(app.root)
+        self.win.overrideredirect(True)
+        self.win.attributes("-topmost", True)
+        try:
+            self.win.wm_attributes("-transparentcolor", TRANSPARENT_COLOR)
+        except Exception:
+            pass
+
+        tk.Label(self.win, text=text, fg=color, bg=TRANSPARENT_COLOR,
+                 font=("Segoe UI", size, "bold")).pack()
+        self.win.geometry(f"+{int(x)}+{int(y)}")
+        self.win.after(20, self.update)
+
+    def update(self):
+        elapsed = time.time() - self.start
+        if elapsed >= self.duration:
+            try: self.win.destroy()
+            except Exception: pass
+            return
+        ny = self.y - elapsed * 55
+        alpha = max(0.05, 1.0 - elapsed / self.duration)
+        try:
+            self.win.geometry(f"+{int(self.x)}+{int(ny)}")
+            self.win.attributes("-alpha", alpha)
+        except Exception:
+            pass
+        self.win.after(30, self.update)
+
+
+class Ball:
+    def __init__(self, app, x, y):
+        self.app = app
+        self.x = float(x)
+        self.y = float(y)
+        self.vx = 0.0
+        self.vy = 0.0
+        self.r = app.cfg["ball_radius"]
+
+        self.win = tk.Toplevel(app.root)
+        self.win.overrideredirect(True)
+        self.win.attributes("-topmost", True)
+        try:
+            self.win.wm_attributes("-transparentcolor", TRANSPARENT_COLOR)
+        except Exception:
+            pass
+
+        size = int(self.r * 2 + 6)
+        self.canvas = tk.Canvas(self.win, width=size, height=size,
+                                bg=TRANSPARENT_COLOR, highlightthickness=0)
+        self.canvas.pack()
+        self._redraw()
+
+        self.is_dragging = False
+        self.drag_offset = (0, 0)
+        self.drag_history = []
+
+        self.canvas.bind("<Button-1>", self.on_press)
+        self.canvas.bind("<B1-Motion>", self.on_drag)
+        self.canvas.bind("<ButtonRelease-1>", self.on_release)
+
+        self.update_window_position()
+
+    def _redraw(self):
+        self.canvas.delete("all")
+        size = int(self.r * 2 + 6)
+        self.canvas.create_oval(3, 3, size - 3, size - 3,
+                                fill="white", outline="black", width=2)
+        cx, cy = size / 2, size / 2
+        self.canvas.create_polygon(
+            cx, cy - self.r * 0.5,
+            cx + self.r * 0.45, cy - self.r * 0.15,
+            cx + self.r * 0.28, cy + self.r * 0.4,
+            cx - self.r * 0.28, cy + self.r * 0.4,
+            cx - self.r * 0.45, cy - self.r * 0.15,
+            fill="black", outline="black")
+
+    def update_window_position(self):
+        size = int(self.r * 2 + 6)
+        self.win.geometry(f"+{int(self.x - size / 2)}+{int(self.y - size / 2)}")
+
+    def on_press(self, event):
+        if self.app.mode != "football":
+            return
+        self.is_dragging = True
+        self.drag_offset = (event.x_root - self.x, event.y_root - self.y)
+        self.vx = 0.0
+        self.vy = 0.0
+        self.drag_history = [(event.x_root, event.y_root, time.time())]
+
+    def on_drag(self, event):
+        if not self.is_dragging:
+            return
+        now = time.time()
+        self.drag_history.append((event.x_root, event.y_root, now))
+        if len(self.drag_history) > 8:
+            self.drag_history.pop(0)
+        self.x = event.x_root - self.drag_offset[0]
+        self.y = event.y_root - self.drag_offset[1]
+        self.update_window_position()
+
+    def on_release(self, event):
+        if not self.is_dragging:
+            return
+        self.is_dragging = False
+        vx = vy = 0.0
+        if len(self.drag_history) >= 2:
+            x1, y1, t1 = self.drag_history[0]
+            x2, y2, t2 = self.drag_history[-1]
+            dt = t2 - t1
+            if dt > 0.01:
+                vx = (x2 - x1) / dt / 60.0
+                vy = (y2 - y1) / dt / 60.0
+        mx = 50
+        self.vx = max(-mx, min(mx, vx))
+        self.vy = max(-mx, min(mx, vy))
+
+    def destroy(self):
+        try: self.win.destroy()
+        except Exception: pass
+
+
+class ScoreWindow:
+    def __init__(self, app):
+        self.app = app
+        self.win = tk.Toplevel(app.root)
+        self.win.overrideredirect(True)
+        self.win.attributes("-topmost", True)
+        try:
+            self.win.attributes("-alpha", 0.9)
+        except Exception:
+            pass
+        self.win.geometry(f"200x80+{app.sw // 2 - 100}+30")
+
+        self.frame = tk.Frame(self.win, bg="#1e1e1e", bd=2, relief="ridge")
+        self.frame.pack(fill="both", expand=True)
+
+        self.title = tk.Label(self.frame, text="⚽ ФУТБОЛ", fg="#bbbbbb",
+                              bg="#1e1e1e", font=("Segoe UI", 9, "bold"))
+        self.title.pack(pady=(4, 0))
+
+        self.label = tk.Label(self.frame, text="0 : 0", fg="white",
+                              bg="#1e1e1e", font=("Segoe UI", 22, "bold"))
+        self.label.pack(pady=(0, 6))
+
+        for w in (self.frame, self.title, self.label):
+            w.bind("<Button-1>", self._start_drag)
+            w.bind("<B1-Motion>", self._drag)
+            w.bind("<Button-3>", lambda e: self.destroy())
+
+        self.drag_off = (0, 0)
+
+    def _start_drag(self, e):
+        self.drag_off = (e.x_root - self.win.winfo_x(),
+                         e.y_root - self.win.winfo_y())
+
+    def _drag(self, e):
+        self.win.geometry(f"+{e.x_root - self.drag_off[0]}+{e.y_root - self.drag_off[1]}")
+
+    def update_score(self, a, b):
+        self.label.config(text=f"{a} : {b}")
+
+    def destroy(self):
+        try: self.win.destroy()
+        except Exception: pass
+
+
+class Pet:
+    def __init__(self, app, x, y, image_path, team=None):
+        self.app = app
+        self.image_path = image_path
+        self.original = app.get_image(image_path)
+        self.team = team
+        self.is_keeper = False
+
+        self.win = tk.Toplevel(app.root)
+        self.win.overrideredirect(True)
+        self.win.attributes("-topmost", True)
+        self.win.wm_attributes("-transparentcolor", TRANSPARENT_COLOR)
+
+        self.canvas = tk.Canvas(self.win, width=CANVAS_SIZE, height=CANVAS_SIZE,
+                                bg=TRANSPARENT_COLOR, highlightthickness=0)
+        self.canvas.pack()
+
+        self.x = x
+        self.y = y
+        self.vel_x = 0.0
+        self.vel_y = 0.0
+        self.angle = 0.0
+        self.spin = 0.0
+
+        self.state = "idle"
+        self.idle_until = time.time() + random.uniform(0.4, 1.6)
+        self.walk_direction = 1
+        self.walk_remaining = 0.0
+        self.walk_phase = 0
+        self.last_anim = time.time()
+
+        self.hp = app.cfg["hp_max"]
+        self.last_drawn_hp = self.hp
+        self.dead = False
+
+        self.is_dragging = False
+        self.drag_offset = (0, 0)
+        self.drag_history = []
+
+        self.tk_image = None
+        self._apply_ground()
+
+        self.canvas.bind("<Button-1>", self.on_press)
+        self.canvas.bind("<B1-Motion>", self.on_drag)
+        self.canvas.bind("<ButtonRelease-1>", self.on_release)
+        self.canvas.bind("<Button-3>", self.on_rmb)
+
+        self.update_window_position()
+
+    # ---------- Картинка ----------
+    def _compose(self, sprite, feet_y=None):
+        img = Image.new("RGBA", (CANVAS_SIZE, CANVAS_SIZE), (0, 0, 0, 0))
+        if feet_y is None:
+            px = (CANVAS_SIZE - sprite.width) // 2
+            py = (CANVAS_SIZE - sprite.height) // 2
+        else:
+            px = (CANVAS_SIZE - sprite.width) // 2
+            py = feet_y - sprite.height
+        img.paste(sprite, (px, py), sprite)
+
+        d = ImageDraw.Draw(img)
+
+        if not self.dead:
+            show_badge = (self.app.mode == "football") or (self.team is not None) \
+                         or (self.app.mode == "battle")
+            if show_badge:
+                team = self.app._get_team(self)
+                badge_size = max(8, int(12 * self.app.cfg["pet_scale"]))
+                bx = (CANVAS_SIZE - badge_size) // 2
+                by = CANVAS_SIZE // 2 - PET_HEIGHT // 2 - badge_size - 10
+                color = (60, 130, 230, 255) if team == 0 else (230, 70, 70, 255)
+                d.rectangle([bx, by, bx + badge_size, by + badge_size],
+                            fill=color, outline=(0, 0, 0, 255), width=1)
+            if getattr(self, "is_keeper", False):
+                # Жёлтая рамка вокруг кубика
+                d.rectangle([bx - 2, by - 2, bx + badge_size + 2, by + badge_size + 2],
+                            outline=(255, 220, 40, 255), width=2)
+
+        hp_max = self.app.cfg["hp_max"]
+        if self.app.mode == "battle" and self.hp < hp_max and not self.dead:
+            bw = max(20, int(44 * self.app.cfg["pet_scale"]))
+            bh = max(3, int(5 * self.app.cfg["pet_scale"]))
+            bx = (CANVAS_SIZE - bw) // 2
+            by = CANVAS_SIZE // 2 - PET_HEIGHT // 2 - 12
+            frac = max(0.0, min(1.0, self.hp / hp_max))
+            d.rectangle([bx - 1, by - 1, bx + bw + 1, by + bh + 1], fill=(0, 0, 0, 220))
+            d.rectangle([bx, by, bx + bw, by + bh], fill=(80, 80, 80, 255))
+            if frac > 0.6:
+                col = (90, 220, 90, 255)
+            elif frac > 0.3:
+                col = (240, 190, 60, 255)
+            else:
+                col = (230, 60, 60, 255)
+            d.rectangle([bx, by, bx + int(bw * frac), by + bh], fill=col)
+
+        bg = Image.new("RGB", img.size, TRANSPARENT_RGB)
+        bg.paste(img, (0, 0), img)
+        return ImageTk.PhotoImage(bg)
+
+    def _apply_ground(self, sprite=None):
+        if sprite is None:
+            sprite = self.original
+        feet_y = CANVAS_SIZE // 2 + PET_HEIGHT // 2
+        self.tk_image = self._compose(sprite, feet_y=feet_y)
+        self._push_to_canvas()
+
+    def _apply_rotated(self, sprite):
+        self.tk_image = self._compose(sprite, feet_y=None)
+        self._push_to_canvas()
+
+    def _push_to_canvas(self):
+        self.canvas.delete("sprite")
+        self.canvas.create_image(CANVAS_SIZE // 2, CANVAS_SIZE // 2,
+                                 image=self.tk_image, anchor="center", tags="sprite")
+
+    def update_window_position(self):
+        wx = int(self.x - CANVAS_SIZE / 2)
+        wy = int(self.y - CANVAS_SIZE / 2)
+        self.win.geometry(f"+{wx}+{wy}")
+
+    # ---------- Мышь ----------
+    def on_press(self, event):
+        if self.app.mode == "edit":
+            return
+        if self.app.mode not in ("play", "football", "battle"):
+            return
+        if self.dead:
+            return
+        self.is_dragging = True
+        self.drag_offset = (event.x_root - self.x, event.y_root - self.y)
+        self.vel_x = self.vel_y = 0
+        self.angle = self.spin = 0
+        self.state = "idle"
+        self._apply_ground()
+        self.drag_history = [(event.x_root, event.y_root, time.time())]
+
+    def on_drag(self, event):
+        if not self.is_dragging:
+            return
+        now = time.time()
+        self.drag_history.append((event.x_root, event.y_root, now))
+        if len(self.drag_history) > 8:
+            self.drag_history.pop(0)
+        self.x = event.x_root - self.drag_offset[0]
+        self.y = event.y_root - self.drag_offset[1]
+        self.update_window_position()
+
+    def on_release(self, event):
+        if not self.is_dragging:
+            return
+        self.is_dragging = False
+        vx = vy = 0.0
+        if len(self.drag_history) >= 2:
+            x1, y1, t1 = self.drag_history[0]
+            x2, y2, t2 = self.drag_history[-1]
+            dt = t2 - t1
+            if dt > 0.01:
+                vx = (x2 - x1) / dt / 60.0
+                vy = (y2 - y1) / dt / 60.0
+        mx = 50
+        vx = max(-mx, min(mx, vx))
+        vy = max(-mx, min(mx, vy))
+        if abs(vx) < 0.3 and abs(vy) < 0.3:
+            vx = random.uniform(-0.5, 0.5)
+            vy = 1.5
+        self.vel_x = vx
+        self.vel_y = vy
+        self.spin = max(-20, min(20, vx * 3))
+        self.angle = 0
+        self.state = "flying"
+
+    def on_rmb(self, event):
+        if self.app.mode == "edit":
+            self.app.remove_pet(self)
+
+    # ---------- Обновление ----------
+    def update(self):
+        if self.dead:
+            return
+        if self.is_dragging:
+            self.update_window_position()
+            return
+        if self.app.mode == "battle":
+            self.battle_update()
+        elif self.app.mode == "pinball":
+            self.pinball_update()
+        elif self.app.mode == "football":
+            self.football_update()
+        else:
+            self.normal_update()
+        self.update_window_position()
+
+    def _fall_check(self):
+        ground_level = self.app.sh - TASKBAR_HEIGHT - PET_HEIGHT / 2
+        if self.state != "flying" and self.y < ground_level - 2:
+            self.state = "flying"
+            self.vel_y = 0.5
+
+    def _walk_anim_frame(self, flip=False):
+        t = time.time()
+        if t - self.last_anim > ANIMATION_SPEED:
+            self.last_anim = t
+            self.walk_phase = 1 - self.walk_phase
+            if self.walk_phase == 1:
+                nw, nh = int(PET_WIDTH * 1.15), int(PET_HEIGHT * 0.85)
+            else:
+                nw, nh = PET_WIDTH, PET_HEIGHT
+            sp = self.original.resize((nw, nh), Image.Resampling.LANCZOS)
+            if flip:
+                sp = sp.transpose(Image.FLIP_LEFT_RIGHT)
+            self._apply_ground(sp)
+
+    # ---------- Пинбол ----------
+    def pinball_update(self):
+        self._fall_check()
+        gl = self.app.sh - TASKBAR_HEIGHT - PET_HEIGHT / 2
+        lb = PET_WIDTH / 2
+        rb = self.app.sw - PET_WIDTH / 2
+        ceil = PET_HEIGHT / 2 + 5
+
+        self.vel_y += self.app.cfg["gravity"] * self.app.cfg["pinball_gravity"]
+        self.y += self.vel_y
+        self.x += self.vel_x
+        self.angle = (self.angle + self.spin) % 360
+
+        if self.y >= gl:
+            self.y = gl
+            if abs(self.vel_y) > 1.5:
+                self.vel_y = -self.vel_y * 0.75
+                self.vel_x *= 0.95
+            else:
+                self.vel_y = -random.uniform(6, 12)
+                self.vel_x += random.uniform(-2, 2)
+
+        if self.y <= ceil:
+            self.y = ceil
+            self.vel_y = abs(self.vel_y) * 0.8
+
+        if self.x <= lb:
+            self.x = lb
+            self.vel_x = abs(self.vel_x) * 0.9
+            self.spin = -self.spin
+        elif self.x >= rb:
+            self.x = rb
+            self.vel_x = -abs(self.vel_x) * 0.9
+            self.spin = -self.spin
+
+        rot = self.original.rotate(self.angle, expand=True, resample=Image.Resampling.BICUBIC)
+        self._apply_rotated(rot)
+
+    # ---------- Обычный ----------
+    def normal_update(self):
+        self._fall_check()
+        t = time.time()
+        gl = self.app.sh - TASKBAR_HEIGHT - PET_HEIGHT / 2
+        lb = PET_WIDTH / 2
+        rb = self.app.sw - PET_WIDTH / 2
+
+        if self.state == "flying":
+            self.vel_y += self.app.cfg["gravity"]
+            self.y += self.vel_y
+            self.x += self.vel_x
+            self.angle = (self.angle + self.spin) % 360
+
+            if self.y >= gl:
+                self.y = gl
+                if abs(self.vel_y) > 3:
+                    self.vel_y = -self.vel_y * self.app.cfg["bounce_factor"]
+                    self.vel_x *= 0.7
+                else:
+                    self.vel_x = self.vel_y = 0
+                    self.angle = self.spin = 0
+                    self.state = "idle"
+                    self.idle_until = t + random.uniform(0.3, 1.5)
+                    self._apply_ground()
+                    return
+
+            if self.x <= lb:
+                self.x = lb
+                self.vel_x = -self.vel_x * self.app.cfg["bounce_factor"]
+                self.spin = -self.spin
+            elif self.x >= rb:
+                self.x = rb
+                self.vel_x = -self.vel_x * self.app.cfg["bounce_factor"]
+                self.spin = -self.spin
+
+            rot = self.original.rotate(self.angle, expand=True, resample=Image.Resampling.BICUBIC)
+            self._apply_rotated(rot)
+
+        elif self.state == "idle":
+            if t >= self.idle_until:
+                self.state = "walking"
+                self.walk_direction = random.choice([-1, 1])
+                self.walk_remaining = random.uniform(self.app.cfg["walk_dist_min"],
+                                                     self.app.cfg["walk_dist_max"])
+                self.last_anim = t
+
+        elif self.state == "walking":
+            self.x += self.app.cfg["walk_speed"] * self.walk_direction
+            self.walk_remaining -= self.app.cfg["walk_speed"]
+            if self.x <= lb:
+                self.x = lb
+                self.walk_direction = 1
+            elif self.x >= rb:
+                self.x = rb
+                self.walk_direction = -1
+
+            if self.walk_remaining <= 0:
+                self.state = "idle"
+                self.idle_until = t + random.uniform(self.app.cfg["idle_min"],
+                                                     self.app.cfg["idle_max"])
+                sp = (self.original if self.walk_direction > 0
+                      else self.original.transpose(Image.FLIP_LEFT_RIGHT))
+                self._apply_ground(sp)
+            else:
+                self._walk_anim_frame(flip=(self.walk_direction < 0))
+
+    # ---------- Бой ----------
+    def battle_update(self):
+        self._fall_check()
+        t = time.time()
+        gl = self.app.sh - TASKBAR_HEIGHT - PET_HEIGHT / 2
+        lb = PET_WIDTH / 2
+        rb = self.app.sw - PET_WIDTH / 2
+
+        if self.state == "flying":
+            self.vel_y += self.app.cfg["gravity"]
+            self.y += self.vel_y
+            self.x += self.vel_x
+            self.angle = (self.angle + self.spin) % 360
+            if self.y >= gl:
+                self.y = gl
+                self.vel_y = 0
+                self.vel_x *= 0.5
+                self.angle = self.spin = 0
+                if abs(self.vel_x) > 0.3:
+                    self.state = "walking"
+                    self.walk_direction = 1 if self.vel_x > 0 else -1
+                    self.walk_remaining = 9999
+                    self.last_anim = t
+                else:
+                    self.state = "idle"
+                    self.idle_until = t + 0.5
+            if self.x <= lb:
+                self.x = lb
+                self.vel_x = abs(self.vel_x) * 0.5
+            elif self.x >= rb:
+                self.x = rb
+                self.vel_x = -abs(self.vel_x) * 0.5
+            rot = self.original.rotate(self.angle, expand=True, resample=Image.Resampling.BICUBIC)
+            self._apply_rotated(rot)
+            return
+
+        enemy = None
+        best = float("inf")
+        for o in self.app.pets:
+            if o is self or o.dead:
+                continue
+            if self.app._get_team(o) == self.app._get_team(self):
+                continue
+            d = math.hypot(o.x - self.x, o.y - self.y)
+            if d < best:
+                best = d
+                enemy = o
+
+        if enemy is None:
+            self._walk_anim_frame(flip=False)
+            return
+
+        dx = enemy.x - self.x
+        dy = enemy.y - self.y
+        d = math.hypot(dx, dy) or 1
+        self.walk_direction = 1 if dx > 0 else -1
+        attack_range = self.app.cfg["battle_range"] * BATTLE_APPROACH
+
+        if d > attack_range:
+            self.x += (dx / d) * self.app.cfg["walk_speed"]
+            self._walk_anim_frame(flip=(self.walk_direction < 0))
+        else:
+            sp = (self.original if self.walk_direction > 0
+                  else self.original.transpose(Image.FLIP_LEFT_RIGHT))
+            self._apply_ground(sp)
+
+    # ---------- Футбол ----------
+    def _predict_ball_landing(self, ball, steps=40):
+        g = self.app.cfg["ball_gravity"]
+        friction = self.app.cfg["ball_friction"]
+
+        x = ball.x
+        y = ball.y
+        vx = ball.vx
+        vy = ball.vy
+        gl = self.app.sh - TASKBAR_HEIGHT - ball.r - 2
+
+        for _ in range(steps):
+            x += vx
+            y += vy
+            vy += g
+            vx *= friction
+            if y >= gl:
+                return x, abs(x - self.x) < PET_WIDTH * 1.6
+            if x < -50 or x > self.app.sw + 50:
+                return x, False
+        return x, abs(x - self.x) < PET_WIDTH * 1.6
+
+    def _predict_ball_at_head_height(self, ball):
+        g = self.app.cfg["ball_gravity"]
+        if g <= 0:
+            return None, None
+
+        head_y = self.y - PET_HEIGHT * 0.6
+        a = 0.5 * g
+        b = ball.vy
+        c = ball.y - head_y
+        disc = b * b - 4 * a * c
+        if disc < 0:
+            return None, None
+
+        sqrt_d = math.sqrt(disc)
+        t1 = (-b - sqrt_d) / (2 * a)
+        t2 = (-b + sqrt_d) / (2 * a)
+
+        t_candidates = [t for t in (t1, t2) if t > 0]
+        if not t_candidates:
+            return None, None
+
+        t_hit = min(t_candidates)
+        if t_hit > 45:
+            return None, None
+
+        future_x = ball.x + ball.vx * t_hit * 0.95
+        return t_hit, future_x
+
+    def football_update(self):
+        self._fall_check()
+        t = time.time()
+        gl = self.app.sh - TASKBAR_HEIGHT - PET_HEIGHT / 2
+        lb = PET_WIDTH / 2
+        rb = self.app.sw - PET_WIDTH / 2
+
+        # ============ ПОЛЁТ ============
+        if self.state == "flying":
+            self.vel_y += self.app.cfg["gravity"]
+            self.y += self.vel_y
+            self.x += self.vel_x
+            self.angle = (self.angle + self.spin) % 360
+            if self.y >= gl:
+                self.y = gl
+                self.vel_y = 0
+                self.vel_x *= 0.5
+                self.angle = self.spin = 0
+                self.state = "idle"
+                self.idle_until = t + 0.2
+            if self.x <= lb:
+                self.x = lb
+                self.vel_x = abs(self.vel_x) * 0.5
+            elif self.x >= rb:
+                self.x = rb
+                self.vel_x = -abs(self.vel_x) * 0.5
+
+            # Удар в воздухе
+            ball = self.app.ball
+            if ball is not None and not ball.is_dragging:
+                dx = ball.x - self.x
+                dy = ball.y - self.y
+                dist = math.hypot(dx, dy)
+                pet_r = PET_WIDTH / 2
+                ball_r = ball.r
+                contact_dist = pet_r + ball_r + 14
+
+                last_kick = getattr(self, "_last_kick_time", 0)
+                if dist < contact_dist and t - last_kick > 0.25:
+                    self._last_kick_time = t
+                    team = self.app._get_team(self)
+                    goal_dir = 1 if team == 0 else -1
+
+                    kick = self.app.cfg["kick_force"]
+                    total_kick = kick * 1.8
+
+                    ball.vx = goal_dir * total_kick * 1.7
+                    limit = self.app.cfg["ball_max_speed"]
+                    ball.vx = max(-limit, min(limit, ball.vx))
+
+                    lift_min = self.app.cfg["ball_lift_min"] * 1.5
+                    lift_max = self.app.cfg["ball_lift_max"] * 1.5
+                    ball.vy = -random.uniform(lift_min, lift_max)
+
+                    FloatingText(self.app, ball.x - 6, ball.y - 24, "!",
+                                 color="#ffee44", size=16, duration=0.5)
+
+            rot = self.original.rotate(self.angle, expand=True,
+                                        resample=Image.Resampling.BICUBIC)
+            self._apply_rotated(rot)
+            return
+
+        ball = self.app.ball
+        if ball is None:
+            self._walk_anim_frame(flip=False)
+            return
+
+        # отладка — печатает состояние питомца каждый кадр
+        _dx = ball.x - self.x
+        _dy = ball.y - self.y
+        _dist = math.hypot(_dx, _dy)
+
+        #print(f"[{id(self)%1000}] team={self.app._get_team(self)} "
+              #f"keeper={self.is_keeper} dist={_dist:.1f} "
+              #f"vert={abs(_dy):.1f} bvx={ball.vx:+.2f} x={self.x:.0f} bx={ball.x:.0f}")
+
+        # ============ УДАР НА ЗЕМЛЕ ============
+        dx = ball.x - self.x
+        dy = ball.y - self.y
+        # Удар по X — основное; по Y проверяем отдельно ниже
+        dist = abs(dx)
+
+        pet_r = PET_WIDTH / 2
+        ball_r = ball.r
+        contact_dist = pet_r + ball_r + 20
+
+        last_kick = getattr(self, "_last_kick_time", 0)
+        kick_cd_ok = t - last_kick > 0.1
+
+        if not ball.is_dragging and dist < contact_dist and kick_cd_ok:
+            vertical_ok = abs(dy) < PET_HEIGHT * 0.9 + ball_r
+            if vertical_ok:
+                self._last_kick_time = t
+                team = self.app._get_team(self)
+                goal_dir = 1 if team == 0 else -1
+
+                kick = self.app.cfg["kick_force"]
+                total_kick = kick
+
+                impulse = goal_dir * total_kick * 1.6
+                if ball.vx * goal_dir >= 0:
+                    ball.vx += impulse * 0.5
+                else:
+                    ball.vx = impulse
+                limit = self.app.cfg["ball_max_speed"]
+                ball.vx = max(-limit, min(limit, ball.vx))
+
+                ball.vy = -random.uniform(self.app.cfg["ball_lift_min"],
+                                          self.app.cfg["ball_lift_max"])
+
+                FloatingText(self.app, ball.x - 6, ball.y - 24, "!",
+                             color="#ffee44", size=14, duration=0.4)
+
+
+        # логируем только подозрительные моменты — мяч стоит, питомец близко
+        #if abs(ball.vx) < 0.5 and abs(ball.x - self.x) < 80:
+            #print(f"[{id(self)%1000}] team={self.app._get_team(self)} "
+                  #f"keeper={self.is_keeper} dist={abs(ball.x-self.x):.1f} "
+                  #f"contact={PET_WIDTH/2 + ball.r + 20:.1f} "
+                  #f"vert={abs(ball.y-self.y):.1f} bvx={ball.vx:+.2f} "
+                  #f"cd={t - getattr(self, '_last_kick_time', 0):.2f} "
+                  #f"x={self.x:.0f} bx={ball.x:.0f}")
+
+        # ============ ПРЫЖОК НА МЯЧ ============
+        if not ball.is_dragging and self.state != "flying":
+            speed = math.hypot(ball.vx, ball.vy)
+            bdx = ball.x - self.x
+
+            fast_enough = speed > 4.0
+            moving_towards = (ball.vx > 0 and bdx > 0) or (ball.vx < 0 and bdx < 0)
+            almost_overhead = abs(bdx) < PET_WIDTH * 0.8
+
+            _, crosses = self._predict_ball_landing(ball, steps=40)
+
+            t_hit, future_x = self._predict_ball_at_head_height(ball)
+            will_cross_head = False
+            if t_hit is not None and future_x is not None:
+                if abs(future_x - self.x) < PET_WIDTH * 1.4 and t_hit < 30:
+                    will_cross_head = True
+
+            jump_cd_ok = t >= getattr(self, "_jump_cooldown", 0)
+            ball_above_feet = ball.y < self.y + PET_HEIGHT * 0.3
+
+            should_jump = (
+                jump_cd_ok
+                and fast_enough
+                and ball_above_feet
+                and (crosses or will_cross_head)
+                and (moving_towards or almost_overhead)
+            )
+
+            if should_jump:
+                self.state = "flying"
+
+                target_x = future_x if future_x is not None else ball.x
+                offset = target_x - self.x
+                self.vel_x = max(-3.5, min(3.5, offset * 0.12))
+
+                base_jump = random.uniform(self.app.cfg["jump_vel_min"],
+                                            self.app.cfg["jump_vel_max"])
+                if ball.y < self.y - PET_HEIGHT:
+                    base_jump *= 1.4
+                self.vel_y = -base_jump
+
+                self.spin = random.choice([-1, 1]) * 3
+                self.angle = 0
+                self._jump_cooldown = t + 0.35
+                return
+
+        # ============ РОЛЬ: ВРАТАРЬ ИЛИ ПОЛЕВОЙ ============
+        my_team = self.app._get_team(self)
+        team_mates = [p for p in self.app.pets
+                      if not p.dead and self.app._get_team(p) == my_team]
+        own_goal_x = 0 if my_team == 0 else self.app.sw
+
+        if self.is_keeper:
+            # Вратарь двигается только в зоне своих ворот
+            keeper_off = self.app.cfg["keeper_offset"]
+            min_x = own_goal_x
+            max_x = own_goal_x + (1 if my_team == 0 else -1) * keeper_off * 2
+            if min_x > max_x:
+                min_x, max_x = max_x, min_x
+
+            # Следим за мячом по X, но в пределах зоны
+            target_x = ball.x
+            # Чуть сдвигаемся навстречу мячу в своей зоне
+            if my_team == 0:
+                target_x = max(min_x, min(max_x, ball.x - 10))
+            else:
+                target_x = min(max_x, max(min_x, ball.x + 10))
+
+            dx_t = target_x - self.x
+            dist_t = abs(dx_t)
+
+            if dist_t > 1:
+                step = self.app.cfg["pet_speed_football"] * 0.9
+                self.x += (dx_t / dist_t) * min(step, dist_t)
+                self.x = max(PET_WIDTH / 2, min(self.app.sw - PET_WIDTH / 2, self.x))
+                self.walk_direction = 1 if dx_t > 0 else -1
+                self._walk_anim_frame(flip=(self.walk_direction < 0))
+            else:
+                self.walk_direction = 1 if ball.x > self.x else -1
+                sp = (self.original if self.walk_direction > 0
+                      else self.original.transpose(Image.FLIP_LEFT_RIGHT))
+                self._apply_ground(sp)
+        else:
+            # Полевой — как раньше: ближайший к мячу атакует, остальные держат позицию
+            closest = None
+            closest_dist = float("inf")
+            for mate in team_mates:
+                if mate.is_keeper:
+                    continue   # вратарь не считается за атакующего
+                d = abs(ball.x - mate.x)
+                if d < closest_dist:
+                    closest_dist = d
+                    closest = mate
+
+            is_attacker = (closest is self)
+
+            if is_attacker:
+                side = 1 if own_goal_x < self.app.sw / 2 else -1
+                target_x = ball.x - side * (pet_r + ball_r - 12)
+
+                dx_t = target_x - self.x
+                dist_t = abs(dx_t)
+
+                if dist_t > 3:
+                    step = self.app.cfg["pet_speed_football"]
+                    self.x += (dx_t / dist_t) * min(step, dist_t)
+                    self.x = max(lb, min(rb, self.x))
+                    self.walk_direction = 1 if dx_t > 0 else -1
+                    self._walk_anim_frame(flip=(self.walk_direction < 0))
+                else:
+                    self.walk_direction = 1 if ball.x > self.x else -1
+                    sp = (self.original if self.walk_direction > 0
+                          else self.original.transpose(Image.FLIP_LEFT_RIGHT))
+                    self._apply_ground(sp)
+            else:
+                target_x = ball.x + (own_goal_x - ball.x) * 0.35
+                idx = team_mates.index(self) if self in team_mates else 0
+                offset = (idx % 2) * 2 - 1
+                target_x += offset * PET_WIDTH * 1.0
+
+                dx_t = target_x - self.x
+                dist_t = abs(dx_t)
+
+                if dist_t > 2:
+                    step = self.app.cfg["pet_speed_football"] * 0.6
+                    self.x += (dx_t / dist_t) * min(step, dist_t)
+                    self.x = max(lb, min(rb, self.x))
+                    self.walk_direction = 1 if dx_t > 0 else -1
+                    self._walk_anim_frame(flip=(self.walk_direction < 0))
+                else:
+                    self.walk_direction = 1 if ball.x > self.x else -1
+                    sp = (self.original if self.walk_direction > 0
+                          else self.original.transpose(Image.FLIP_LEFT_RIGHT))
+                    self._apply_ground(sp)
+        # не даём питомцам одной команды слипаться
+        my_team = self.app._get_team(self)
+        for other in self.app.pets:
+            if other is self or other.dead:
+                continue
+            if self.app._get_team(other) != my_team:
+                continue
+            dx_o = other.x - self.x
+            if abs(dx_o) < PET_WIDTH * 0.9 and abs(other.y - self.y) < PET_HEIGHT * 0.9:
+                push = (PET_WIDTH * 0.9 - abs(dx_o)) / 2 + 0.5
+                if dx_o >= 0:
+                    self.x -= push
+                else:
+                    self.x += push
+                self.x = max(lb, min(rb, self.x))
+
+    def damage(self, amount):
+        self.hp -= amount
+        if self.hp <= 0:
+            self.die()
+
+    def hit_by(self, from_x, from_y, push_x, push_y, dmg_mult, crit_text):
+        self.vel_x += push_x
+        self.vel_y += push_y - 1.5
+        if self.state != "flying":
+            self.state = "flying"
+            self.spin = random.choice([-1, 1]) * random.uniform(4, 10)
+        self.damage(self.app.cfg["battle_damage"] * dmg_mult)
+        if crit_text:
+            color = "#ff2b2b" if dmg_mult == 2 else "#ffcc00"
+            size = 14 if dmg_mult == 2 else 18
+            FloatingText(self.app, self.x - 15, self.y - PET_HEIGHT / 2 - 10,
+                         crit_text, color=color, size=size, duration=1.0)
+
+    def die(self):
+        if self.dead:
+            return
+        self.dead = True
+        try: self.win.destroy()
+        except Exception: pass
+        if self in self.app.pets:
+            self.app.pets.remove(self)
+
+    def destroy(self):
+        self.dead = True
+        try: self.win.destroy()
+        except Exception: pass
+
+
+class App:
+    def __init__(self):
+        self.root = tk.Tk()
+        self.root.title("Taskbar Pets")
+        self.root.resizable(True, True)
+        self.root.minsize(420, 420)
+        self.root.attributes("-topmost", True)
+
+        self.sw = self.root.winfo_screenwidth()
+        self.sh = self.root.winfo_screenheight()
+
+        self.cfg = dict(DEFAULT_CFG)
+        self._load_cfg_from_file(silent=True)
+        apply_scale(self.cfg["pet_scale"])
+
+        self.pets = []
+        self.image_cache = {}
+        self.current_image_path = None
+        self.mode = "play"
+        self.edit_overlay = None
+
+        self.ball = None
+        self.football_score = [0, 0]
+        self.team_map = {}
+        self.score_window = None
+        self.score_display_var = tk.StringVar(value="popup")
+        self.team_var = tk.StringVar(value="auto")
+
+        self._scale_apply_job = None
+
+        self._build_ui()
+        self.root.after(16, self.tick)
+        self.root.mainloop()
+
+    # ---------- Сохранение/загрузка ----------
+    def _load_cfg_from_file(self, silent=False):
+        if not os.path.exists(CFG_FILE):
+            return
+        try:
+            with open(CFG_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            for k in DEFAULT_CFG:
+                if k in data:
+                    self.cfg[k] = data[k]
+        except Exception as e:
+            if not silent:
+                messagebox.showerror("Ошибка", f"Не удалось загрузить настройки:\n{e}")
+
+    def _save_cfg_to_file(self):
+        try:
+            with open(CFG_FILE, "w", encoding="utf-8") as f:
+                json.dump(self.cfg, f, indent=2, ensure_ascii=False)
+            messagebox.showinfo("Готово", f"Настройки сохранены в {CFG_FILE}")
+        except Exception as e:
+            messagebox.showerror("Ошибка", f"Не удалось сохранить настройки:\n{e}")
+
+    # ---------- UI ----------
+    def _build_ui(self):
+        frm = ttk.Frame(self.root, padding=10)
+        frm.grid(row=0, column=0, sticky="nsew")
+        self.root.rowconfigure(0, weight=1)
+        self.root.columnconfigure(0, weight=1)
+        self.frm = frm
+
+        ttk.Label(frm, text="Режим:").grid(row=0, column=0, sticky="w")
+        self.mode_var = tk.StringVar(value="play")
+        modes_frame = ttk.Frame(frm)
+        modes_frame.grid(row=0, column=1, columnspan=4, sticky="w", pady=4)
+        for i, (val, text) in enumerate([
+            ("play", "Play"), ("edit", "Edit"),
+            ("pinball", "Pinball"), ("battle", "Battle"),
+            ("football", "Футбол"),
+        ]):
+            ttk.Radiobutton(modes_frame, text=text, value=val,
+                            variable=self.mode_var,
+                            command=self.on_mode_change).grid(row=0, column=i, padx=4)
+
+        ttk.Label(frm, text="Картинка:").grid(row=1, column=0, sticky="w", pady=(6, 0))
+        self.path_var = tk.StringVar(value="(по умолчанию)")
+        ttk.Entry(frm, textvariable=self.path_var, width=28).grid(
+            row=1, column=1, columnspan=2, sticky="we", pady=(6, 0))
+        ttk.Button(frm, text="Обзор...", command=self.on_browse).grid(
+            row=1, column=3, padx=(4, 0), pady=(6, 0))
+        ttk.Button(frm, text="По умолчанию", command=self.on_default_image).grid(
+            row=1, column=4, padx=(4, 0), pady=(6, 0))
+
+        ttk.Label(frm, text="Команда:").grid(row=2, column=0, sticky="w", pady=(6, 0))
+        team_frame = ttk.Frame(frm)
+        team_frame.grid(row=2, column=1, columnspan=4, sticky="w", pady=(6, 0))
+        for i, (val, text) in enumerate([
+            ("auto", "Авто"), ("blue", "Синяя"), ("red", "Красная"),
+        ]):
+            ttk.Radiobutton(team_frame, text=text, value=val,
+                            variable=self.team_var).grid(row=0, column=i, padx=4)
+
+        ttk.Button(frm, text="Добавить персонажа", command=self.on_add_pet).grid(
+            row=3, column=0, columnspan=2, sticky="we", pady=(10, 0))
+        ttk.Button(frm, text="Очистить всех", command=self.on_clear_all).grid(
+            row=3, column=2, columnspan=3, sticky="we", pady=(10, 0))
+
+        nb = ttk.Notebook(frm)
+        nb.grid(row=4, column=0, columnspan=5, sticky="we", pady=(10, 0))
+
+        tab_battle = ttk.Frame(nb, padding=6)
+        tab_pinball = ttk.Frame(nb, padding=6)
+        tab_football = ttk.Frame(nb, padding=6)
+        tab_general = ttk.Frame(nb, padding=6)
+        nb.add(tab_battle, text="Бой")
+        nb.add(tab_pinball, text="Пинбол")
+        nb.add(tab_football, text="Футбол")
+        nb.add(tab_general, text="Общее")
+
+        self._build_sliders(tab_battle, [
+            ("hp_max",               "HP персонажа:",        10, 500, "{:.0f}"),
+            ("battle_damage",        "Урон за удар:",         0.1, 5, "{:.2f}"),
+            ("battle_push_min",      "Толчок мин:",           1, 15, "{:.1f}"),
+            ("battle_push_max",      "Толчок макс:",          5, 40, "{:.1f}"),
+            ("crit_threshold",       "Порог «Крит» (x2):",    5, 30, "{:.1f}"),
+            ("super_crit_threshold", "Порог «Крит+» (x3):",  10, 40, "{:.1f}"),
+            ("battle_range",         "Радиус удара:",        20, 200, "{:.0f}"),
+        ])
+
+        self._build_sliders(tab_pinball, [
+            ("paddle_radius",        "Радиус ракетки:",      20, 200, "{:.0f}"),
+            ("pinball_push_min",     "Импульс мин:",          1, 20, "{:.1f}"),
+            ("pinball_push_max",     "Импульс макс:",         5, 50, "{:.1f}"),
+            ("pinball_speed_limit",  "Макс. скорость:",       5, 80, "{:.0f}"),
+            ("pinball_gravity",      "Гравитация (множ.):",   0, 2,  "{:.2f}"),
+        ])
+
+        self._build_sliders(tab_football, [
+            ("ball_radius",        "Радиус мяча:",           6, 40,  "{:.0f}"),
+            ("ball_friction",      "Трение мяча:",           0.9, 1.0, "{:.3f}"),
+            ("ball_max_speed",     "Макс. скорость мяча:",   5, 80,  "{:.0f}"),
+            ("ball_gravity",       "Гравитация мяча:",       0.1, 3,  "{:.2f}"),
+            ("ball_bounce",        "Отскок мяча:",           0, 0.95, "{:.2f}"),
+            ("ball_lift_min",      "Подброс мин:",           0.5, 20, "{:.1f}"),
+            ("ball_lift_max",      "Подброс макс:",          1, 30,  "{:.1f}"),
+            ("pet_speed_football", "Скорость бега:",         0.5, 10, "{:.1f}"),
+            ("kick_force",         "Сила удара:",            0.5, 20, "{:.1f}"),
+            ("goal_bias",          "Стремление к воротам:",  0, 15,  "{:.1f}"),
+            ("jump_radius",        "Радиус прыжка:",        20, 300, "{:.0f}"),
+            ("jump_vel_min",       "Прыжок мин:",            2, 25,  "{:.1f}"),
+            ("jump_vel_max",       "Прыжок макс:",           3, 35,  "{:.1f}"),
+        ])
+
+        ttk.Button(tab_football, text="Сбросить счёт",
+                   command=self._reset_score).grid(row=100, column=0, columnspan=3,
+                                                   sticky="we", pady=(8, 0))
+
+        score_grp = ttk.LabelFrame(tab_football, text="Показ счёта", padding=4)
+        score_grp.grid(row=101, column=0, columnspan=3, sticky="we", pady=(8, 0))
+        for i, (val, text) in enumerate([
+            ("popup",  "Отдельное окно (перетаскивается)"),
+            ("inline", "Только в настройках"),
+            ("hidden", "Скрыть"),
+        ]):
+            ttk.Radiobutton(score_grp, text=text, value=val,
+                            variable=self.score_display_var,
+                            command=self._apply_score_display
+                            ).grid(row=i, column=0, sticky="w")
+
+        general_items = [
+            ("gravity",       "Гравитация:",          0.1, 3,  "{:.2f}"),
+            ("walk_speed",    "Скорость ходьбы:",     0.3, 8,  "{:.2f}"),
+            ("bounce_factor", "Отскок:",              0, 0.95, "{:.2f}"),
+            ("walk_dist_min", "Ходьба мин (пикс.):",  5, 300,  "{:.0f}"),
+            ("walk_dist_max", "Ходьба макс (пикс.):", 10, 600, "{:.0f}"),
+            ("idle_min",      "Пауза мин (сек):",     0.1, 5,  "{:.2f}"),
+            ("idle_max",      "Пауза макс (сек):",    0.2, 15, "{:.2f}"),
+        ]
+        self._build_sliders(tab_general, general_items)
+
+        scale_row = len(general_items)
+        ttk.Label(tab_general, text="Масштаб персонажей:", width=22, anchor="w").grid(
+            row=scale_row, column=0, sticky="w", pady=(6, 0))
+        self.scale_var = tk.DoubleVar(value=self.cfg["pet_scale"])
+        ttk.Scale(tab_general, from_=0.4, to=2.5, variable=self.scale_var,
+                  command=self._on_scale_slider,
+                  orient="horizontal", length=180).grid(
+            row=scale_row, column=1, sticky="we", padx=(4, 6), pady=(6, 0))
+        self.scale_lbl = ttk.Label(tab_general, text=f"{self.cfg['pet_scale']:.2f}",
+                                    width=9, anchor="e")
+        self.scale_lbl.grid(row=scale_row, column=2, sticky="e", pady=(6, 0))
+
+        def _scale_updater(*args):
+            self.scale_lbl.config(text=f"{self.scale_var.get():.2f}")
+        self.scale_var.trace_add("write", _scale_updater)
+
+        ttk.Button(tab_general, text="Применить масштаб сейчас",
+                   command=self._apply_scale_change).grid(
+            row=scale_row + 1, column=0, columnspan=3, sticky="we", pady=(6, 0))
+
+        col_frame = ttk.Frame(frm)
+        col_frame.grid(row=5, column=0, columnspan=5, sticky="we", pady=(6, 0))
+        self.collision_var = tk.BooleanVar(value=self.cfg["collision"])
+        def _on_collision_toggle():
+            self.cfg["collision"] = self.collision_var.get()
+        ttk.Checkbutton(col_frame,
+                        text="Коллизия (Battle: не наслаиваются, Pinball: отскок)",
+                        variable=self.collision_var,
+                        command=_on_collision_toggle).grid(row=0, column=0, sticky="w")
+
+        self.inline_score_label = ttk.Label(frm, text="Счёт: 0 : 0",
+                                            font=("Segoe UI", 12, "bold"))
+
+        btns = ttk.Frame(frm)
+        btns.grid(row=7, column=0, columnspan=5, sticky="we", pady=(6, 0))
+        ttk.Button(btns, text="Сохранить настройки", command=self._save_cfg_to_file).grid(
+            row=0, column=0, sticky="we", padx=(0, 4))
+        ttk.Button(btns, text="Загрузить настройки", command=self._reload_cfg_from_file).grid(
+            row=0, column=1, sticky="we", padx=4)
+        ttk.Button(btns, text="Сбросить всё", command=self._reset_cfg).grid(
+            row=0, column=2, sticky="we", padx=(4, 0))
+        btns.columnconfigure(0, weight=1)
+        btns.columnconfigure(1, weight=1)
+        btns.columnconfigure(2, weight=1)
+
+        self.hint = ttk.Label(frm, text="", foreground="#555",
+                              wraplength=460, justify="left")
+        self.hint.grid(row=8, column=0, columnspan=5, sticky="w", pady=(10, 0))
+
+        self._update_hint()
+        self._apply_score_display()
+
+    def _build_sliders(self, parent, items):
+        for row, (key, label, lo, hi, fmt) in enumerate(items):
+            var = tk.DoubleVar(value=self.cfg[key])
+
+            def on_change(_=None, k=key, v=var):
+                self.cfg[k] = v.get()
+                if k == "walk_dist_min" and self.cfg["walk_dist_min"] > self.cfg["walk_dist_max"]:
+                    self.cfg["walk_dist_max"] = self.cfg["walk_dist_min"]
+                if k == "idle_min" and self.cfg["idle_min"] > self.cfg["idle_max"]:
+                    self.cfg["idle_max"] = self.cfg["idle_min"]
+                if k == "battle_push_min" and self.cfg["battle_push_min"] > self.cfg["battle_push_max"]:
+                    self.cfg["battle_push_max"] = self.cfg["battle_push_min"]
+                if k == "pinball_push_min" and self.cfg["pinball_push_min"] > self.cfg["pinball_push_max"]:
+                    self.cfg["pinball_push_max"] = self.cfg["pinball_push_min"]
+                if k == "ball_lift_min" and self.cfg["ball_lift_min"] > self.cfg["ball_lift_max"]:
+                    self.cfg["ball_lift_max"] = self.cfg["ball_lift_min"]
+                if k == "jump_vel_min" and self.cfg["jump_vel_min"] > self.cfg["jump_vel_max"]:
+                    self.cfg["jump_vel_max"] = self.cfg["jump_vel_min"]
+
+            ttk.Label(parent, text=label, width=22, anchor="w").grid(
+                row=row, column=0, sticky="w", pady=1)
+            ttk.Scale(parent, from_=lo, to=hi, variable=var, command=on_change,
+                      orient="horizontal", length=180).grid(
+                row=row, column=1, sticky="we", padx=(4, 6), pady=1)
+
+            entry_var = tk.StringVar(value=fmt.format(var.get()))
+            entry = ttk.Entry(parent, textvariable=entry_var, width=9, justify="right")
+            entry.grid(row=row, column=2, sticky="e", pady=1)
+
+            def commit(*args, v=var, ev=entry_var, f=fmt, lo=lo, hi=hi):
+                try:
+                    val = float(ev.get().replace(",", "."))
+                except ValueError:
+                    ev.set(f.format(v.get()))
+                    return
+                val = max(lo, min(hi, val))
+                v.set(val)
+                ev.set(f.format(val))
+
+            entry.bind("<Return>", commit)
+            entry.bind("<FocusOut>", commit)
+
+            def updater(*args, v=var, ev=entry_var, f=fmt):
+                ev.set(f.format(v.get()))
+            var.trace_add("write", updater)
+
+        parent.columnconfigure(1, weight=1)
+
+    # ---------- Масштаб ----------
+    def _on_scale_slider(self, _=None):
+        if self._scale_apply_job:
+            try:
+                self.root.after_cancel(self._scale_apply_job)
+            except Exception:
+                pass
+        self._scale_apply_job = self.root.after(400, self._apply_scale_change)
+
+    def _apply_scale_change(self):
+        self._scale_apply_job = None
+        new_scale = round(float(self.scale_var.get()), 2)
+        if abs(new_scale - self.cfg["pet_scale"]) < 0.01:
+            return
+        self.change_scale(new_scale)
+
+    def change_scale(self, new_scale):
+        self.cfg["pet_scale"] = new_scale
+        apply_scale(new_scale)
+        self.image_cache.clear()
+
+        snapshots = []
+        for p in self.pets:
+            snapshots.append({
+                'x': p.x, 'y': p.y,
+                'image_path': p.image_path,
+                'team': p.team,
+                'state': p.state,
+                'vel_x': p.vel_x, 'vel_y': p.vel_y,
+                'angle': p.angle, 'spin': p.spin,
+                'hp': p.hp,
+            })
+
+        ball_state = None
+        if self.ball:
+            ball_state = (self.ball.x, self.ball.y, self.ball.vx, self.ball.vy)
+
+        for p in self.pets[:]:
+            p.destroy()
+        self.pets.clear()
+        if self.ball:
+            self.ball.destroy()
+            self.ball = None
+
+        for s in snapshots:
+            p = Pet(self, s['x'], s['y'], s['image_path'], team=s['team'])
+            p.state = s['state']
+            p.vel_x = s['vel_x']
+            p.vel_y = s['vel_y']
+            p.angle = s['angle']
+            p.spin = s['spin']
+            p.hp = min(s['hp'], self.cfg["hp_max"])
+            p.last_drawn_hp = p.hp
+            if p.state == 'flying':
+                rot = p.original.rotate(p.angle, expand=True,
+                                         resample=Image.Resampling.BICUBIC)
+                p._apply_rotated(rot)
+            else:
+                p._apply_ground()
+            self.pets.append(p)
+
+        if ball_state is not None and self.mode == "football":
+            bx, by, bvx, bvy = ball_state
+            self.ball = Ball(self, bx, by)
+            self.ball.vx = bvx
+            self.ball.vy = bvy
+
+    def _update_hint(self):
+        hints = {
+            "play":     "Play: перетаскивай персонажа мышью и бросай.",
+            "edit":     "Edit: ЛКМ по персонажу — команда, по пустому — спавн. ПКМ — удалить. Esc — выйти.",
+            "pinball":  "Pinball: води курсором рядом с персонажами — они разлетаются.",
+            "battle":   "Battle: персонажи разных команд дерутся. Криты x2/x3.",
+            "football": "Футбол: команды по кубику. Мяч можно таскать. Питомцы прыгают на летящий мяч.",
+        }
+        self.hint.config(text=hints.get(self.mode, ""))
+
+    # ---------- Счёт ----------
+    def _apply_score_display(self):
+        mode = self.score_display_var.get()
+        in_football = (self.mode == "football")
+
+        if mode == "inline" and in_football:
+            self.inline_score_label.grid(row=6, column=0, columnspan=5,
+                                         sticky="w", pady=(8, 0))
+        else:
+            self.inline_score_label.grid_forget()
+
+        if mode == "popup" and in_football:
+            if self.score_window is None:
+                self.score_window = ScoreWindow(self)
+            self.score_window.update_score(*self.football_score)
+        else:
+            if self.score_window is not None:
+                self.score_window.destroy()
+                self.score_window = None
+
+    def _reset_score(self):
+        self.football_score = [0, 0]
+        if self.score_window:
+            self.score_window.update_score(0, 0)
+        self.inline_score_label.config(text="Счёт: 0 : 0")
+
+    def _update_score_labels(self):
+        a, b = self.football_score
+        if self.score_window:
+            self.score_window.update_score(a, b)
+        self.inline_score_label.config(text=f"Счёт: {a} : {b}")
+
+    # ---------- Изображения ----------
+    def get_image(self, path):
+        if path in self.image_cache:
+            return self.image_cache[path]
+        if path is None or not os.path.exists(path):
+            img = make_default_image()
+        else:
+            try:
+                img = Image.open(path).convert("RGBA")
+                img = img.resize((PET_WIDTH, PET_HEIGHT), Image.Resampling.LANCZOS)
+            except Exception as e:
+                print("Не удалось загрузить:", e)
+                img = make_default_image()
+        self.image_cache[path] = img
+        return img
+
+    def on_browse(self):
+        p = filedialog.askopenfilename(
+            title="Выбери картинку персонажа",
+            filetypes=[("Изображения", "*.png *.gif *.bmp *.jpg *.jpeg"),
+                       ("Все файлы", "*.*")])
+        if p:
+            self.current_image_path = p
+            self.path_var.set(p)
+
+    def on_default_image(self):
+        self.current_image_path = None
+        self.path_var.set("(по умолчанию)")
+
+    # ---------- Команды ----------
+    def _team_from_ui(self):
+        t = self.team_var.get()
+        if t == "blue":
+            return 0
+        elif t == "red":
+            return 1
+        return None
+
+    def _get_team(self, pet):
+        if pet.team is not None:
+            return pet.team
+        key = pet.image_path
+        if key in self.team_map:
+            return self.team_map[key]
+        idx = min(len(self.team_map), 1)
+        self.team_map[key] = idx
+        return idx
+
+    def _num_teams(self):
+        teams = set()
+        for p in self.pets:
+            if p.dead:
+                continue
+            teams.add(self._get_team(p))
+        return len(teams)
+
+    def assign_team_to(self, pet):
+        pet.team = self._team_from_ui()
+        pet._apply_ground()
+
+    # ---------- Управление ----------
+    def on_add_pet(self):
+        x = random.randint(PET_WIDTH, self.sw - PET_WIDTH)
+        y = self.sh - TASKBAR_HEIGHT - PET_HEIGHT / 2
+        self.spawn_pet(x, y)
+
+    def on_clear_all(self):
+        for p in self.pets[:]:
+            p.destroy()
+        self.pets.clear()
+        self.team_map.clear()
+        if self.mode == "football":
+            self._reset_ball()
+
+    def spawn_pet(self, x, y):
+        x = max(PET_WIDTH / 2, min(self.sw - PET_WIDTH / 2, x))
+        y = max(PET_HEIGHT / 2, min(self.sh - TASKBAR_HEIGHT - PET_HEIGHT / 2, y))
+
+        team = self._team_from_ui()
+        p = Pet(self, x, y, self.current_image_path, team=team)
+
+        ground_level = self.sh - TASKBAR_HEIGHT - PET_HEIGHT / 2
+        if y < ground_level - 1:
+            p.state = "flying"
+            p.vel_x = random.uniform(-0.5, 0.5)
+            p.vel_y = 0.5
+            p.spin = random.choice([-1, 1]) * random.uniform(3, 8)
+            p.angle = 0
+        else:
+            p.state = "idle"
+            p.idle_until = time.time() + random.uniform(0.3, 1.2)
+
+        self.pets.append(p)
+        if self.edit_overlay:
+            self._lift_overlay()
+        if self.mode == "football":
+            self._assign_keeper_and_positions()
+        return p
+
+    def remove_pet(self, p):
+        p.destroy()
+        if p in self.pets:
+            self.pets.remove(p)
+
+    def _lift_overlay(self):
+        if self.edit_overlay:
+            try:
+                self.edit_overlay.lift()
+                self.edit_overlay.attributes("-topmost", True)
+            except Exception:
+                pass
+
+    # ---------- Мяч ----------
+    def _reset_ball(self):
+        cx = self.sw / 2
+        cy = self.sh - TASKBAR_HEIGHT - 20
+        if self.ball is None:
+            self.ball = Ball(self, cx, cy)
+        else:
+            self.ball.x = cx
+            self.ball.y = cy
+            self.ball.vx = 0.0
+            self.ball.vy = 0.0
+            self.ball.is_dragging = False
+            self.ball.drag_history = []
+            self.ball.r = self.cfg["ball_radius"]
+            self.ball._redraw()
+            self.ball.update_window_position()
+
+    def _assign_keeper_and_positions(self):
+        """Назначает вратаря каждой команде и расставляет всех по своим местам."""
+        gl = self.sh - TASKBAR_HEIGHT - PET_HEIGHT / 2
+        cx = self.sw / 2
+        spread = self.cfg["kickoff_spread"]
+        keeper_off = self.cfg["keeper_offset"]
+
+        # Группируем живых по команде
+        by_team = {0: [], 1: []}
+        for p in self.pets:
+            if p.dead:
+                continue
+            by_team[self._get_team(p)].append(p)
+
+        for team, mates in by_team.items():
+            if not mates:
+                continue
+
+            own_goal_x = 0 if team == 0 else self.sw
+            # Вратарь — тот, кто ближе всего к своим воротам (по X)
+            keeper = min(mates, key=lambda p: abs(p.x - own_goal_x))
+            for p in mates:
+                p.is_keeper = (p is keeper)
+
+            # Вратарь встаёт у ворот
+            keeper.x = own_goal_x + (1 if team == 0 else -1) * keeper_off
+            keeper.y = gl
+            keeper.state = "idle"
+            keeper.vel_x = keeper.vel_y = 0
+            keeper.angle = keeper.spin = 0
+            keeper._apply_ground()
+
+            # Остальные — в рандомные позиции в своей половине
+            others = [p for p in mates if p is not keeper]
+            random.shuffle(others)
+            for p in others:
+                if team == 0:
+                    # вратарь у левого края, полевые — правее вратаря
+                    p.x = random.uniform(own_goal_x + keeper_off + PET_WIDTH, cx + spread * 0.2)
+                else:
+                    # вратарь у правого края, полевые — левее вратаря
+                    p.x = random.uniform(cx - spread * 0.2, own_goal_x - keeper_off - PET_WIDTH)
+                p.y = gl
+                p.state = "idle"
+                p.vel_x = p.vel_y = 0
+                p.angle = p.spin = 0
+                p._apply_ground()
+                p.spin = 0
+                p.angle = 0
+                p._last_kick_time = 0
+                p._jump_cooldown = 0
+
+    def _destroy_ball(self):
+        if self.ball is not None:
+            self.ball.destroy()
+            self.ball = None
+
+    # ---------- Режимы ----------
+    def on_mode_change(self):
+        prev_mode = self.mode
+        self.mode = self.mode_var.get()
+
+        if prev_mode == "football" and self.mode != "football":
+            self._destroy_ball()
+
+        for p in self.pets:
+            p.is_dragging = False
+            p.hp = self.cfg["hp_max"]
+            p.last_drawn_hp = p.hp
+            p.state = "idle"
+            p.idle_until = time.time() + random.uniform(0.3, 1.2)
+            p._apply_ground()
+
+        if self.mode == "edit":
+            self._show_edit_overlay()
+        else:
+            self._hide_edit_overlay()
+
+        if self.mode == "football":
+            self.team_map.clear()
+            self._reset_score()
+            self._reset_ball()
+            self._assign_keeper_and_positions()
+
+        self._update_hint()
+        self._apply_score_display()
+
+    def _show_edit_overlay(self):
+        if self.edit_overlay:
+            return
+        self.edit_overlay = tk.Toplevel(self.root)
+        self.edit_overlay.overrideredirect(True)
+        self.edit_overlay.attributes("-topmost", True)
+        try:
+            self.edit_overlay.attributes("-alpha", 0.01)
+        except Exception:
+            pass
+        self.edit_overlay.geometry(f"{self.sw}x{self.sh}+0+0")
+
+        cv = tk.Canvas(self.edit_overlay, width=self.sw, height=self.sh,
+                       bg="#0a0a0a", highlightthickness=0)
+        cv.pack()
+        cv.bind("<Button-1>", self._edit_lmb)
+        cv.bind("<Button-3>", self._edit_rmb)
+
+        self.edit_overlay.focus_force()
+        self.edit_overlay.bind("<Escape>", lambda e: self._exit_edit())
+        self.root.bind("<Escape>", lambda e: self._exit_edit())
+        self.edit_overlay.lift()
+
+    def _hide_edit_overlay(self):
+        if not self.edit_overlay:
+            return
+        try: self.edit_overlay.destroy()
+        except Exception: pass
+        self.edit_overlay = None
+        try: self.root.unbind("<Escape>")
+        except Exception: pass
+
+    def _exit_edit(self):
+        self.mode_var.set("play")
+        self.on_mode_change()
+
+    def _edit_lmb(self, event):
+        x, y = event.x_root, event.y_root
+        best = None
+        best_d = float("inf")
+        for p in self.pets:
+            d = math.hypot(p.x - x, p.y - y)
+            if d < PET_WIDTH + 20 and d < best_d:
+                best = p
+                best_d = d
+        if best is not None:
+            self.assign_team_to(best)
+            return
+        self.spawn_pet(x, y)
+
+    def _edit_rmb(self, event):
+        x, y = event.x_root, event.y_root.best = None
+        best_d = float("inf")
+        for p in self.pets:
+            d = math.hypot(p.x - x, p.y - y)
+            if d < PET_WIDTH + 20 and d < best_d:
+                best = p
+                best_d = d
+        if best is not None:
+            self.remove_pet(best)
+
+    # ---------- Сброс / перезагрузка ----------
+    def _reset_cfg(self):
+        if not messagebox.askyesno("Сброс",
+                                    "Сбросить все настройки к значениям по умолчанию?\n"
+                                    "Все персонажи будут удалены."):
+            return
+        self.cfg = dict(DEFAULT_CFG)
+        apply_scale(self.cfg["pet_scale"])
+        self._hard_reset()
+
+    def _reload_cfg_from_file(self):
+        self._load_cfg_from_file(silent=False)
+        apply_scale(self.cfg["pet_scale"])
+        self._hard_reset()
+
+    def _hard_reset(self):
+        for w in self.root.winfo_children():
+            w.destroy()
+        self.pets.clear()
+        self.edit_overlay = None
+        if self.ball:
+            self.ball.destroy()
+            self.ball = None
+        if self.score_window:
+            self.score_window.destroy()
+            self.score_window = None
+        self.team_map.clear()
+        self.football_score = [0, 0]
+        self.image_cache.clear()
+        self.team_var = tk.StringVar(value="auto")
+        self.score_display_var = tk.StringVar(value="popup")
+        self.mode_var = tk.StringVar(value="play")
+        self.mode = "play"
+        self._build_ui()
+
+    # ---------- Игровой цикл ----------
+    def tick(self):
+        if self.mode == "pinball":
+            self._pinball_step()
+
+        for p in self.pets[:]:
+            p.update()
+
+        if self.mode == "battle":
+            self._battle_interactions()
+            if self.collision_var.get():
+                self._resolve_collisions_battle()
+        elif self.mode == "pinball":
+            if self.collision_var.get():
+                self._resolve_collisions_pinball()
+        elif self.mode == "football":
+            self._football_step()
+
+        self.root.after(16, self.tick)
+
+    def _football_step(self):
+        if self.ball is None:
+            return
+        b = self.ball
+        if b.is_dragging:
+            return
+
+        b.r = self.cfg["ball_radius"]
+        b.x += b.vx
+        b.y += b.vy
+        b.vy += self.cfg["ball_gravity"]
+
+        gl = self.sh - TASKBAR_HEIGHT - b.r - 2
+        if b.y >= gl:
+            b.y = gl
+            if abs(b.vy) > 1.5:
+                b.vy = -b.vy * self.cfg["ball_bounce"]
+            else:
+                b.vy = 0
+
+        two_teams = self._num_teams() >= 2
+        goal_height_limit = gl - self.sh * 0.25
+
+        if b.x < b.r:
+            if two_teams and b.y > goal_height_limit:
+                self.football_score[1] += 1
+                self._update_score_labels()
+                FloatingText(self, self.sw / 2 - 40, self.sh / 2 - 100, "GOAL!",
+                             color="#ffcc00", size=28, duration=1.5)
+                self._assign_keeper_and_positions()
+                self._reset_ball()
+                return
+            else:
+                b.x = b.r
+                b.vx = abs(b.vx) * 0.7
+        elif b.x > self.sw - b.r:
+            if two_teams and b.y > goal_height_limit:
+                self.football_score[0] += 1
+                self._update_score_labels()
+                FloatingText(self, self.sw / 2 - 40, self.sh / 2 - 100, "GOAL!",
+                             color="#ffcc00", size=28, duration=1.5)
+                self._assign_keeper_and_positions()
+                self._reset_ball()
+                return
+            else:
+                b.x = self.sw - b.r
+                b.vx = -abs(b.vx) * 0.7
+
+        limit = self.cfg["ball_max_speed"]
+        if abs(b.vx) > limit:
+            b.vx = limit if b.vx > 0 else -limit
+
+        b.vx *= self.cfg["ball_friction"]
+        if abs(b.vx) < 0.05:
+            b.vx = 0
+
+        b.update_window_position()
+
+    def _pinball_step(self):
+        try:
+            mx = self.root.winfo_pointerx()
+            my = self.root.winfo_pointery()
+        except Exception:
+            return
+
+        PADDLE_RADIUS = self.cfg["paddle_radius"]
+        BASE_PUSH = self.cfg["pinball_push_min"]
+        MAX_PUSH = self.cfg["pinball_push_max"]
+        SPEED_LIMIT = self.cfg["pinball_speed_limit"]
+        DAMPING = 0.995
+
+        for p in self.pets:
+            if p.is_dragging:
+                continue
+
+            if p.state != "flying" and p.y < self.sh - TASKBAR_HEIGHT - PET_HEIGHT / 2 - 1:
+                p.state = "flying"
+
+            dx = p.x - mx
+            dy = p.y - my
+            d = math.hypot(dx, dy)
+
+            if d < PADDLE_RADIUS and d > 0.1:
+                closeness = 1.0 - d / PADDLE_RADIUS
+                push = BASE_PUSH + (MAX_PUSH - BASE_PUSH) * closeness
+
+                nx = dx / d
+                ny = dy / d
+
+                if ny > 0.2:
+                    ny -= 0.6
+                    L = math.hypot(nx, ny) or 1
+                    nx /= L
+                    ny /= L
+
+                p.vel_x = nx * push
+                p.vel_y = ny * push
+
+                if p.vel_y > -2:
+                    p.vel_y -= random.uniform(1.0, 3.0)
+
+                p.spin = random.choice([-1, 1]) * random.uniform(8, 18)
+
+                if p.state != "flying":
+                    p.state = "flying"
+
+            sp = math.hypot(p.vel_x, p.vel_y)
+            if sp > SPEED_LIMIT:
+                k = SPEED_LIMIT / sp
+                p.vel_x *= k
+                p.vel_y *= k
+
+            p.vel_x *= DAMPING
+            p.vel_y *= DAMPING
+
+    def _battle_interactions(self):
+        for a in self.pets[:]:
+            if a.dead:
+                continue
+            for b in self.pets[:]:
+                if b is a or b.dead:
+                    continue
+                if self._get_team(a) == self._get_team(b):
+                    continue
+                dx = b.x - a.x
+                dy = b.y - a.y
+                d = math.hypot(dx, dy)
+                if d >= self.cfg["battle_range"]:
+                    continue
+                if d < 0.1:
+                    dx, dy, d = 1, 0, 1
+
+                push_strength = random.uniform(self.cfg["battle_push_min"],
+                                               self.cfg["battle_push_max"])
+
+                dmg_mult = 1.0
+                crit_text = None
+                if push_strength >= self.cfg["super_crit_threshold"]:
+                    dmg_mult = 3.0
+                    crit_text = "Крит+"
+                elif push_strength >= self.cfg["crit_threshold"]:
+                    dmg_mult = 2.0
+                    crit_text = "Крит"
+
+                b.hit_by(a.x, a.y,
+                         push_x=dx / d * push_strength,
+                         push_y=-push_strength * 0.3,
+                         dmg_mult=dmg_mult,
+                         crit_text=crit_text)
+                a.damage(self.cfg["battle_damage"] * 0.25)
+
+    def _resolve_collisions_battle(self):
+        collision_min_x = PET_WIDTH * 0.85
+        for i, a in enumerate(self.pets):
+            if a.dead:
+                continue
+            for b in self.pets[i + 1:]:
+                if b.dead:
+                    continue
+                dx = b.x - a.x
+                dy = b.y - a.y
+                if abs(dy) < PET_HEIGHT * 0.7 and abs(dx) < collision_min_x:
+                    overlap = collision_min_x - abs(dx)
+                    push = overlap / 2 + 0.5
+                    if dx >= 0:
+                        a.x -= push
+                        b.x += push
+                    else:
+                        a.x += push
+                        b.x -= push
+                    a.x = max(PET_WIDTH / 2, min(self.sw - PET_WIDTH / 2, a.x))
+                    b.x = max(PET_WIDTH / 2, min(self.sw - PET_WIDTH / 2, b.x))
+
+    def _resolve_collisions_pinball(self):
+        RESTITUTION = 0.95
+        for i, a in enumerate(self.pets):
+            if a.dead:
+                continue
+            for b in self.pets[i + 1:]:
+                if b.dead:
+                    continue
+
+                dx = b.x - a.x
+                dy = b.y - a.y
+                r = PET_WIDTH * 0.55
+                dist = math.hypot(dx, dy)
+                if dist >= 2 * r or dist < 0.01:
+                    continue
+
+                overlap = 2 * r - dist
+                nx = dx / dist
+                ny = dy / dist
+                a.x -= nx * overlap / 2
+                b.x += nx * overlap / 2
+                a.y -= ny * overlap / 2
+                b.y += ny * overlap / 2
+
+                rvx = b.vel_x - a.vel_x
+                rvy = b.vel_y - a.vel_y
+                vn = rvx * nx + rvy * ny
+
+                if vn > 0:
+                    continue
+
+                j = -(1 + RESTITUTION) * vn / 2
+                a.vel_x -= j * nx
+                a.vel_y -= j * ny
+                b.vel_x += j * nx
+                b.vel_y += j * ny
+
+                a.spin += random.uniform(-3, 3)
+                b.spin += random.uniform(-3, 3)
+
+                if a.state != "flying":
+                    a.state = "flying"
+                if b.state != "flying":
+                    b.state = "flying"
+
+
+if __name__ == "__main__":
+    App()
